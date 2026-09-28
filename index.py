@@ -8,9 +8,6 @@ import subprocess
 import platform
 
 import nltk
-import googleapiclient.discovery
-import googleapiclient.errors
-from deepmultilingualpunctuation import PunctuationModel
 from youtube_transcript_api import YouTubeTranscriptApi
 
 logging.basicConfig(level=logging.INFO, force=True)
@@ -64,6 +61,10 @@ def remove_double_greater_than(text):
 
 
 def add_punctuation(text, punctuation_model):
+    # Imported lazily: deepmultilingualpunctuation pulls in torch + transformers
+    # (several GB), which are only needed when --punctuated is requested.
+    from deepmultilingualpunctuation import PunctuationModel
+
     if punctuation_model != "":
         model = PunctuationModel(model=punctuation_model)
     else:
@@ -113,8 +114,12 @@ def parse_chapters(description):
 
 
 def get_transcript(video_id, language, video_info, verbose=True):
-    transcript_list = YouTubeTranscriptApi.get_transcript(
-        video_id, languages=[language])
+    # youtube-transcript-api 1.x replaced the old static API with an instance API.
+    # `YouTubeTranscriptApi.get_transcript(...)` no longer exists; `fetch()` now
+    # returns a FetchedTranscript of FetchedTranscriptSnippet objects
+    # (attributes .text / .start / .duration) rather than a list of dicts.
+    transcript_list = YouTubeTranscriptApi().fetch(
+        video_id, languages=(language,))
 
     if video_info["title"] != "":
         transcript = f'# {video_info["title"]}\n\n'
@@ -127,7 +132,7 @@ def get_transcript(video_id, language, video_info, verbose=True):
 
     for i, line in enumerate(transcript_list):
         # Floor and convert to integer
-        start_time = int(math.floor(line['start']))
+        start_time = int(math.floor(line.start))
 
         # Check if current_chapter_index is within the valid range
         if 0 <= current_chapter_index < len(chapters):
@@ -150,11 +155,11 @@ def get_transcript(video_id, language, video_info, verbose=True):
                     f"Error processing chapter timestamp: {chapter_time}")
                 logging.error(f"Error details: {e}")
 
-        line['text'] = remove_tags(line['text'])
-        line['text'] = remove_escape_sequences(line['text'])
-        line['text'] = remove_double_greater_than(line['text'])
-        if line['text']:
-            transcript += line['text'].strip() + ' '
+        text = remove_tags(line.text)
+        text = remove_escape_sequences(text)
+        text = remove_double_greater_than(text)
+        if text:
+            transcript += text.strip() + ' '
 
         # Log progress information
         if verbose and i % 100 == 0:  # Adjust the log frequency as needed
@@ -203,6 +208,10 @@ def process_and_save_transcript(video_id, video_info, language, generate_punctua
 
 def getVideoInfo(video_id):
     try:
+        # Imported lazily so the core transcript path does not require the
+        # Google API client (video metadata degrades to empty title/chapters).
+        import googleapiclient.discovery
+
         # Set up Google API credentials using API key
         api_key = os.environ.get('YOUTUBE_API_KEY')
         if api_key is None:
@@ -246,24 +255,26 @@ def main():
 
     args = parser.parse_args()
 
-    # Install NLTK punkt if not already installed
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        logging.error('NLTK punkt not found.')
-        logging.info('Downloading punkt...')
+    # NLTK >= 3.9 requires the 'punkt_tab' resource; 3.8.x only needed 'punkt'.
+    for resource in ('tokenizers/punkt', 'tokenizers/punkt_tab'):
         try:
-            nltk.download('punkt')
-        except Exception as e:
-            logging.error(f'Error: {e}')
+            nltk.data.find(resource)
+        except LookupError:
+            name = resource.split('/')[-1]
+            logging.error(f'NLTK {name} not found.')
+            logging.info(f'Downloading {name}...')
+            try:
+                nltk.download(name)
+            except Exception as e:
+                logging.error(f'Error: {e}')
 
-            # Check if the Errno 60 error is thrown and suggest using a proxy/vpn
-            if 'Errno 60' in str(e):
-                logging.error(
-                    'Error downloading punkt. Try using a proxy or a VPN.')
-            else:
-                logging.error('Error downloading punkt. Exiting.')
-            exit(1)
+                # Check if the Errno 60 error is thrown and suggest using a proxy/vpn
+                if 'Errno 60' in str(e):
+                    logging.error(
+                        f'Error downloading {name}. Try using a proxy or a VPN.')
+                else:
+                    logging.error(f'Error downloading {name}. Exiting.')
+                exit(1)
 
     # if verbose is false, set logging level to error
     if not args.verbose:
